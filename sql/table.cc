@@ -7707,15 +7707,18 @@ int TABLE::update_virtual_fields(handler *h, enum_vcol_update_mode update_mode)
 
 int TABLE::update_virtual_field(Field *vf)
 {
-  DBUG_ASSERT(!in_use->is_error());
-  Query_arena backup_arena;
   DBUG_ENTER("TABLE::update_virtual_field");
+  Query_arena backup_arena;
+  Turn_errors_to_warnings_handler suppress_errors;
+  ulong warn_count= in_use->get_stmt_da()->warn_count();
+  in_use->push_internal_handler(&suppress_errors);
   in_use->set_n_backup_active_arena(expr_arena, &backup_arena);
   bitmap_clear_all(&tmp_set);
   vf->vcol_info->expr->walk(&Item::update_vcol_processor, 0, &tmp_set);
   vf->vcol_info->expr->save_in_field(vf, 0);
   in_use->restore_active_arena(expr_arena, &backup_arena);
-  DBUG_RETURN(in_use->is_error());
+  in_use->pop_internal_handler();
+  DBUG_RETURN(in_use->get_stmt_da()->warn_count() > warn_count);
 }
 
 
