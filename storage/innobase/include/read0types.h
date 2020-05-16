@@ -36,23 +36,39 @@ Created 2/16/1997 Heikki Tuuri
   Read view lists the trx ids of those transactions for which a consistent read
   should not see the modifications to the database.
 */
-class ReadView
+class ReadViewBase
 {
   /**
-    View state.
-
-    Implemented as atomic to allow mutex-free view close and re-use.
-    Non-owner thread is allowed to call is_open() alone without mutex
-    protection as well. E.g. trx_sys.view_count() does this.
-
-    If non-owner thread intends to access other members as well, both
-    is_open() and other members accesses must be pretected by trx->mutex.
-    E.g. trx_sys.clone_oldest_view().
+    The read should not see any transaction with trx id >= this value.
+    In other words, this is the "high water mark".
   */
-  std::atomic<bool> m_open;
+  trx_id_t m_low_limit_id;
+
+  /**
+    The read should see all trx ids which are strictly
+    smaller (<) than this value. In other words, this is the
+    low water mark".
+  */
+  trx_id_t m_up_limit_id;
+
+  /** Set of RW transactions that was active when this snapshot was taken */
+  trx_ids_t m_ids;
+
+  /**
+    The view does not need to see the undo logs for transactions whose
+    transaction number is strictly smaller (<) than this value: they can be
+    removed in purge if not needed by other views.
+  */
+  trx_id_t m_low_limit_no;
+
+protected:
+  bool empty() { return m_ids.empty(); }
+
+  /** @return the up limit id */
+  trx_id_t up_limit_id() const { return m_up_limit_id; }
 
 public:
-  ReadView(): m_open(false), m_low_limit_id(0) {}
+  ReadViewBase(): m_low_limit_id(0) {}
 
 
   /**
@@ -64,37 +80,33 @@ public:
 
     @param other    view to copy from
   */
-  void copy(const ReadView &other)
+  void copy(const ReadViewBase &other)
   {
     ut_ad(&other != this);
-    if (!other.is_open())
-      return;
-
     if (m_low_limit_no > other.m_low_limit_no)
       m_low_limit_no= other.m_low_limit_no;
     if (m_low_limit_id > other.m_low_limit_id)
       m_low_limit_id= other.m_low_limit_id;
 
     trx_ids_t::iterator dst= m_ids.begin();
-    for (trx_ids_t::const_iterator src= other.m_ids.begin();
-         src != other.m_ids.end(); src++)
+    for (const auto &src: other.m_ids)
     {
-      if (*src >= m_low_limit_id)
+      if (src >= m_low_limit_id)
         break;
 loop:
       if (dst == m_ids.end())
       {
-        m_ids.push_back(*src);
+        m_ids.push_back(src);
         dst= m_ids.end();
         continue;
       }
-      if (*dst < *src)
+      if (*dst < src)
       {
         dst++;
         goto loop;
       }
-      else if (*dst > *src)
-        dst= m_ids.insert(dst, *src) + 1;
+      else if (*dst > src)
+        dst= m_ids.insert(dst, src) + 1;
     }
     m_ids.erase(std::lower_bound(dst, m_ids.end(), m_low_limit_id),
                 m_ids.end());
@@ -102,6 +114,90 @@ loop:
     m_up_limit_id= m_ids.empty() ? m_low_limit_id : m_ids.front();
     ut_ad(m_up_limit_id <= m_low_limit_id);
   }
+
+
+  /**
+    Creates a snapshot where exactly the transactions serialized before this
+    point in time are seen in the view.
+
+    @param[in,out] trx transaction
+  */
+  inline void snapshot(trx_t *trx);
+
+
+  /**
+    Check whether transaction id is valid.
+    @param[in] id transaction id to check
+    @param[in] name table name
+
+    @todo changes_visible() was an unfortunate choice for this check.
+    It should be moved towards the funcions that load trx id like
+    trx_read_trx_id(). No need to issue a warning, error log message should
+    be enough. Although statement should ideally fail if it sees corrupt
+    data.
+  */
+  static void check_trx_id_sanity(trx_id_t id, const table_name_t &name);
+
+
+  /**
+    Check whether the changes by id are visible.
+    @param[in] id transaction id to check against the view
+    @param[in] name table name
+    @return whether the view sees the modifications of id.
+  */
+  bool changes_visible(trx_id_t id, const table_name_t &name) const
+  MY_ATTRIBUTE((warn_unused_result))
+  {
+    if (id >= m_low_limit_id)
+    {
+      check_trx_id_sanity(id, name);
+      return false;
+    }
+    return id < m_up_limit_id ||
+           m_ids.empty() ||
+           !std::binary_search(m_ids.begin(), m_ids.end(), id);
+  }
+
+
+  /**
+    @param id transaction to check
+    @return true if view sees transaction id
+  */
+  bool sees(trx_id_t id) const { return id < m_up_limit_id; }
+
+  /** @return the low limit no */
+  trx_id_t low_limit_no() const { return m_low_limit_no; }
+
+  /** @return the low limit id */
+  trx_id_t low_limit_id() const { return m_low_limit_id; }
+};
+
+
+/** A ReadView with extra members required for trx_t::read_view. */
+class ReadView: public ReadViewBase
+{
+  /**
+    View state.
+
+    Implemented as atomic to allow mutex-free view close and re-use.
+    Non-owner thread is allowed to call is_open() alone without mutex
+    protection as well. E.g. trx_sys.view_count() does this.
+
+    If non-owner thread intends to access other members as well, both
+    is_open() and other members accesses must be pretected by m_mutex.
+    E.g. copy_to().
+  */
+  std::atomic<bool> m_open;
+
+  /** For synchronisation with purge coordinator. */
+  mutable ib_mutex_t m_mutex;
+
+  /** trx id of creating transaction, set to TRX_ID_MAX for free views. */
+  trx_id_t m_creator_trx_id;
+
+public:
+  ReadView(): m_open(false) { mutex_create(LATCH_ID_READ_VIEW, &m_mutex); }
+  ~ReadView() { mutex_free(&m_mutex); }
 
 
   /**
@@ -129,15 +225,6 @@ loop:
 
 
   /**
-    Creates a snapshot where exactly the transactions serialized before this
-    point in time are seen in the view.
-
-    @param[in,out] trx transaction
-  */
-  inline void snapshot(trx_t *trx);
-
-
-  /**
     Sets the creator transaction id.
 
     This should be set only for views created by RW transactions.
@@ -156,93 +243,27 @@ loop:
   */
   void print_limits(FILE *file) const
   {
+    mutex_enter(&m_mutex);
     if (is_open())
       fprintf(file, "Trx read view will not see trx with"
                     " id >= " TRX_ID_FMT ", sees < " TRX_ID_FMT "\n",
-                    m_low_limit_id, m_up_limit_id);
+                    low_limit_id(), up_limit_id());
+    mutex_exit(&m_mutex);
   }
 
 
-	/** Check whether transaction id is valid.
-	@param[in]	id		transaction id to check
-	@param[in]	name		table name */
-	static void check_trx_id_sanity(
-		trx_id_t		id,
-		const table_name_t&	name);
-
-	/** Check whether the changes by id are visible.
-	@param[in]	id	transaction id to check against the view
-	@param[in]	name	table name
-	@return whether the view sees the modifications of id. */
-	bool changes_visible(
-		trx_id_t		id,
-		const table_name_t&	name) const
-		MY_ATTRIBUTE((warn_unused_result))
-	{
-		if (id < m_up_limit_id || id == m_creator_trx_id) {
-
-			return(true);
-		}
-
-		check_trx_id_sanity(id, name);
-
-		if (id >= m_low_limit_id) {
-
-			return(false);
-
-		} else if (m_ids.empty()) {
-
-			return(true);
-		}
-
-		return(!std::binary_search(m_ids.begin(), m_ids.end(), id));
-	}
-
-	/**
-	@param id		transaction to check
-	@return true if view sees transaction id */
-	bool sees(trx_id_t id) const
-	{
-		return(id < m_up_limit_id);
-	}
-
-	/**
-	@return the low limit no */
-	trx_id_t low_limit_no() const
-	{
-		return(m_low_limit_no);
-	}
-
-	/**
-	@return the low limit id */
-	trx_id_t low_limit_id() const
-	{
-		return(m_low_limit_id);
-	}
+  /** A wrapper around ReadViewBase::changes_visible(). */
+  bool changes_visible(trx_id_t id, const table_name_t &name) const
+  { return id == m_creator_trx_id || ReadViewBase::changes_visible(id, name); }
 
 
-private:
-	/** The read should not see any transaction with trx id >= this
-	value. In other words, this is the "high water mark". */
-	trx_id_t	m_low_limit_id;
-
-	/** The read should see all trx ids which are strictly
-	smaller (<) than this value.  In other words, this is the
-	low water mark". */
-	trx_id_t	m_up_limit_id;
-
-	/** trx id of creating transaction, set to TRX_ID_MAX for free
-	views. */
-	trx_id_t	m_creator_trx_id;
-
-	/** Set of RW transactions that was active when this snapshot
-	was taken */
-	trx_ids_t	m_ids;
-
-	/** The view does not need to see the undo logs for transactions
-	whose transaction number is strictly smaller (<) than this value:
-	they can be removed in purge if not needed by other views */
-	trx_id_t	m_low_limit_no;
+  /** A wrapper around ReadViewBase::copy(). */
+  void copy_to(ReadViewBase &to) const
+  {
+    mutex_enter(&m_mutex);
+    if (is_open())
+      to.copy(*this);
+    mutex_exit(&m_mutex);
+  }
 };
-
 #endif

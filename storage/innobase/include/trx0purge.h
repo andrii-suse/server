@@ -138,7 +138,7 @@ public:
 	que_t*		query;		/*!< The query graph which will do the
 					parallelized purge operation */
 	MY_ALIGNED(CACHE_LINE_SIZE)
-	ReadView	view;		/*!< The purge will not remove undo logs
+	ReadViewBase	view;		/*!< The purge will not remove undo logs
 					which are >= this view (purge view) */
 
 	/** Iterator to the undo log records of committed transactions */

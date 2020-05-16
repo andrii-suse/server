@@ -180,7 +180,7 @@ will mark their views as closed but not actually free their views.
 
   @param[in,out] trx transaction
 */
-inline void ReadView::snapshot(trx_t *trx)
+inline void ReadViewBase::snapshot(trx_t *trx)
 {
   trx_sys.snapshot_ids(trx, &m_ids, &m_low_limit_id, &m_low_limit_no);
   std::sort(m_ids.begin(), m_ids.end());
@@ -231,15 +231,15 @@ void ReadView::open(trx_t *trx)
   else if (!srv_read_only_mode)
   {
     m_creator_trx_id= trx->id;
-    if (trx_is_autocommit_non_locking(trx) && m_ids.empty() &&
-        m_low_limit_id == trx_sys.get_max_trx_id())
+    if (trx_is_autocommit_non_locking(trx) && empty() &&
+        low_limit_id() == trx_sys.get_max_trx_id())
       m_open.store(true, std::memory_order_relaxed);
     else
     {
-      mutex_enter(&trx->mutex);
+      mutex_enter(&m_mutex);
       snapshot(trx);
       m_open.store(true, std::memory_order_relaxed);
-      mutex_exit(&trx->mutex);
+      mutex_exit(&m_mutex);
     }
   }
 }
@@ -259,10 +259,6 @@ void trx_sys_t::clone_oldest_view()
   /* Find oldest view. */
   for (const trx_t *trx= UT_LIST_GET_FIRST(trx_list); trx;
        trx= UT_LIST_GET_NEXT(trx_list, trx))
-  {
-    mutex_enter(&trx->mutex);
-    purge_sys.view.copy(trx->read_view);
-    mutex_exit(&trx->mutex);
-  }
+    trx->read_view.copy_to(purge_sys.view);
   mutex_exit(&mutex);
 }
